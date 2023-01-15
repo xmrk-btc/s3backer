@@ -152,6 +152,8 @@ static int s3b_dcache_read(struct s3b_dcache *priv, off_t offset, void *data, si
 static int s3b_dcache_write(struct s3b_dcache *priv, off_t offset, const void *data, size_t len);
 static int s3b_dcache_write2(struct s3b_dcache *priv, int fd, const char *filename, off_t offset, const void *data, size_t len);
 
+static void s3b_dcache_ensure_file_size(struct s3b_dcache *priv, size_t len);
+
 // Internal variables
 static const struct dir_entry zero_entry;
 
@@ -535,6 +537,13 @@ s3b_dcache_read_block(struct s3b_dcache *priv, u_int dslot, void *dest, u_int of
     // Done
     return 0;
 }
+
+
+static int block_part_is_zeros(const void* data, u_int len)
+{
+    return memcmp(zero_block, data, len) == 0;
+}
+
 
 /*
  * Write data into one dslot.
@@ -990,10 +999,60 @@ s3b_dcache_read(struct s3b_dcache *priv, off_t offset, void *data, size_t len)
     return 0;
 }
 
+static void s3b_dcache_ensure_file_size(struct s3b_dcache *priv, size_t len)
+{
+    struct stat statbuf;
+    fstat(priv->fd, &statbuf);
+    if(statbuf.st_size < len) {
+        ftruncate(priv->fd, len);
+    }
+}
+
+// consider blocks of this size for hole punching
+#define MIN_HOLE_SIZE 4096
+
 static int
 s3b_dcache_write(struct s3b_dcache *priv, off_t offset, const void *data, size_t len)
 {
-    return s3b_dcache_write2(priv, priv->fd, priv->filename, offset, data, len);
+    s3b_dcache_ensure_file_size(priv, offset + len);
+
+    size_t start = 0, cur_len = 0;
+
+    // while there is at least MIN_HOLE_SIZE bytes to process
+    while(start + MIN_HOLE_SIZE <= len) {
+        while((start + cur_len + MIN_HOLE_SIZE <= len) &&
+              (block_part_is_zeros((const char*)data + start + cur_len, MIN_HOLE_SIZE))) {
+            cur_len += MIN_HOLE_SIZE;
+        }
+
+        if(cur_len > 0) {
+            int r;
+
+            if ((r = fallocate(priv->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset + start, cur_len)) != 0) {
+                (*priv->log)(LOG_ERR, "fallocate(\"%s\"): %s", priv->filename, strerror(r));
+                return r;
+            }
+        }
+
+        start += cur_len;
+        cur_len = 0;
+
+        while((start + cur_len + MIN_HOLE_SIZE <= len) &&
+              (!block_part_is_zeros((const char*)data + start + cur_len, MIN_HOLE_SIZE))) {
+            cur_len += MIN_HOLE_SIZE;
+        }
+
+        if(cur_len > 0) {
+            int r;
+            if((r = s3b_dcache_write2(priv, priv->fd, priv->filename, offset + start, (const char*)data + start, cur_len)) != 0)
+                return r;
+        }
+
+        start += cur_len;
+        cur_len = 0;
+    }
+
+    return s3b_dcache_write2(priv, priv->fd, priv->filename, offset + start, (const char*)data + start, len - start);
 }
 
 static int
